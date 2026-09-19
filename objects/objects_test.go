@@ -552,12 +552,15 @@ func TestPrintAllObjs(t *testing.T) {
 }
 
 // TestPrintObjectStatesCollision asserts that two sibling root objects whose
-// nicknames sanitize to the same getAGoodFileName() are a hard error rather
-// than a silent overwrite (issue #107).
+// nicknames sanitize to the same getAGoodFileName() are disambiguated with an
+// ordinal suffix rather than silently overwriting one another (issue #107).
+// TTS does not guarantee GUID uniqueness inside containers, so real mods hit
+// this and must remain decomposable.
 func TestPrintObjectStatesCollision(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		objs []map[string]interface{}
+		want []string
 	}{
 		{
 			// Objects inside containers can share a GUID in practice; two
@@ -567,6 +570,7 @@ func TestPrintObjectStatesCollision(t *testing.T) {
 				{"GUID": "abc123"},
 				{"GUID": "abc123"},
 			},
+			want: []string{"abc123", "abc123-2"},
 		},
 		{
 			// Nicknames differing only in stripped punctuation collapse to
@@ -576,6 +580,19 @@ func TestPrintObjectStatesCollision(t *testing.T) {
 				{"GUID": "abc123", "Nickname": "My Deck ()"},
 				{"GUID": "abc123", "Nickname": "My Deck []"},
 			},
+			want: []string{"MyDeck.abc123", "MyDeck.abc123-2"},
+		},
+		{
+			// Three-way collisions keep counting, and an unrelated object
+			// between them does not perturb the numbering.
+			name: "three way",
+			objs: []map[string]interface{}{
+				{"GUID": "dup", "Nickname": "Card"},
+				{"GUID": "other", "Nickname": "Token"},
+				{"GUID": "dup", "Nickname": "Card"},
+				{"GUID": "dup", "Nickname": "Card"},
+			},
+			want: []string{"Card.dup", "Token.other", "Card.dup-2", "Card.dup-3"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,16 +602,20 @@ func TestPrintObjectStatesCollision(t *testing.T) {
 				Dir: ff,
 				J:   ff,
 			}
-			if _, err := p.PrintObjectStates("", tc.objs); err == nil {
-				t.Errorf("expected a filename collision error, got nil")
+			got, err := p.PrintObjectStates("", tc.objs)
+			if err != nil {
+				t.Fatalf("PrintObjectStates() unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("order want != got:\n%v\n", diff)
 			}
 		})
 	}
 }
 
 // TestContainedObjectCollision asserts that two contained (sibling) objects
-// that produce the same getAGoodFileName() cause parseFromJSON to error rather
-// than silently overwrite one another (issue #107).
+// producing the same getAGoodFileName() are disambiguated rather than one
+// silently overwriting the other (issue #107).
 func TestContainedObjectCollision(t *testing.T) {
 	o := objConfig{}
 	err := o.parseFromJSON(map[string]interface{}{
@@ -604,8 +625,12 @@ func TestContainedObjectCollision(t *testing.T) {
 			map[string]interface{}{"GUID": "dup", "Nickname": "Card"},
 		},
 	})
-	if err == nil {
-		t.Errorf("expected a filename collision error for contained objects, got nil")
+	if err != nil {
+		t.Fatalf("parseFromJSON() unexpected error: %v", err)
+	}
+	want := []string{"Card.dup", "Card.dup-2"}
+	if diff := cmp.Diff(want, o.subObjOrder); diff != "" {
+		t.Errorf("subObjOrder want != got:\n%v\n", diff)
 	}
 }
 

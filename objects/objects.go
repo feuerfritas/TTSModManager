@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -18,6 +19,7 @@ type objConfig struct {
 	gmnotesPath        string
 	subObjDir          string
 	subObjOrder        []string // array of base filenames of subobjects
+	fnameOverride      string   // set when a sibling collision forced an ordinal suffix, or when read back from disk
 	stateNames         map[string]string
 	subObj             []*objConfig
 	states             map[string]*objConfig
@@ -115,7 +117,6 @@ func (o *objConfig) parseFromJSON(data map[string]interface{}) error {
 				return fmt.Errorf("parseFromJSON(%v): %v", stateObj, err)
 			}
 			o.states[stateName] = stateO
-			o.stateNames[stateName] = stateO.getAGoodFileName()
 		}
 	}
 	delete(o.data, "States")
@@ -135,20 +136,37 @@ func (o *objConfig) parseFromJSON(data map[string]interface{}) error {
 				return fmt.Errorf("parsing sub object of %s : %v", o.guid, err)
 			}
 			o.subObj = append(o.subObj, &so)
-			o.subObjOrder = append(o.subObjOrder, so.getAGoodFileName())
 		}
 		delete(o.data, "ContainedObjects")
 	}
 
 	// Contained objects and states are all written into the same subdirectory
 	// (see printToFile), so their filenames must be collectively unique.
+	//
+	// States are held in a map, and Go randomises map iteration order. Feeding
+	// them to the resolver in that order would hand out ordinal suffixes
+	// differently between runs, so a decomposition would not be reproducible --
+	// which is the property the whole diff-and-merge workflow depends on. Sort
+	// by state name to make it deterministic.
+	stateKeys := make([]string, 0, len(o.states))
+	for stateName := range o.states {
+		stateKeys = append(stateKeys, stateName)
+	}
+	sort.Strings(stateKeys)
+
 	children := make([]*objConfig, 0, len(o.subObj)+len(o.states))
 	children = append(children, o.subObj...)
-	for _, st := range o.states {
-		children = append(children, st)
+	for _, stateName := range stateKeys {
+		children = append(children, o.states[stateName])
 	}
-	if err := checkFilenameCollisions(children); err != nil {
-		return fmt.Errorf("children of %q: %v", o.guid, err)
+	resolveFilenameCollisions(children)
+
+	// Only now are filenames final, so record the orderings that refer to them.
+	for _, so := range o.subObj {
+		o.subObjOrder = append(o.subObjOrder, so.getAGoodFileName())
+	}
+	for _, stateName := range stateKeys {
+		o.stateNames[stateName] = o.states[stateName].getAGoodFileName()
 	}
 
 	return nil
@@ -333,6 +351,12 @@ func (o *objConfig) printToFile(filepath string, p *Printer) error {
 }
 
 func (o *objConfig) getAGoodFileName() string {
+	// A name resolved elsewhere -- by collision disambiguation, or by having
+	// been read back off disk -- wins, so that the name written during reverse
+	// and the name looked up during build are always the same string.
+	if o.fnameOverride != "" {
+		return o.fnameOverride
+	}
 	// This allows any letter or number from any language, plus _, -, and !
 	reg := regexp.MustCompile(`[^\p{L}\p{N}_!-]+`)
 
@@ -348,21 +372,32 @@ func (o *objConfig) getAGoodFileName() string {
 	return n + "." + o.guid
 }
 
-// checkFilenameCollisions returns an error if any two objects in the slice
-// produce the same getAGoodFileName(). The name is both an object's on-disk
-// filename and its identity in the *_order arrays, so a collision among
-// siblings sharing a directory would silently overwrite the first object with
-// the second. It must be a hard error, not a silent overwrite (see issue #107).
-func checkFilenameCollisions(objs []*objConfig) error {
-	seen := map[string]string{} // filename -> guid that first produced it
+// resolveFilenameCollisions gives every object in the slice a filename unique
+// among its siblings. The name is both an object's on-disk filename and its
+// identity in the *_order arrays, so a collision would silently overwrite the
+// first object with the second -- which must never happen (see issue #107).
+//
+// TTS does not guarantee GUID uniqueness for objects inside containers: it only
+// renumbers an object when it is drawn out onto the table. Real Workshop mods
+// therefore contain sibling objects sharing both a nickname and a GUID -- often
+// genuinely distinct copies differing only in Transform or ColorDiffuse. Erroring
+// out makes those mods undecomposable, so instead the second and later occurrences
+// get an ordinal suffix appended after the GUID.
+//
+// The suffix cannot itself collide: a GUID is six hex characters, so no naturally
+// derived name ends in "<guid>-<n>". Assignment follows document order, which makes
+// it deterministic -- the same input always yields the same names, which is what
+// lets the decomposed tree be diffed and merged across versions.
+func resolveFilenameCollisions(objs []*objConfig) {
+	seen := map[string]int{} // filename -> how many objects have claimed it
 	for _, o := range objs {
 		name := o.getAGoodFileName()
-		if prevGUID, ok := seen[name]; ok {
-			return fmt.Errorf("filename collision: %q is produced by two sibling objects (GUIDs %q and %q); sibling filenames must be unique", name, prevGUID, o.guid)
+		n := seen[name]
+		seen[name] = n + 1
+		if n > 0 {
+			o.fnameOverride = fmt.Sprintf("%s-%d", name, n+1)
 		}
-		seen[name] = o.guid
 	}
-	return nil
 }
 
 func (o *objConfig) tryGetNonEmptyStr(key string) (string, error) {
@@ -445,6 +480,10 @@ func (d *db) parseFromFolder(relpath string) error {
 		if err != nil {
 			return fmt.Errorf("parseFromFile(%s): %v", file, err)
 		}
+		// Key by the name on disk rather than the one derived from the data:
+		// a disambiguated sibling's file is "<nickname>.<guid>-2.json", and the
+		// *_order arrays refer to it by exactly that.
+		o.fnameOverride = strings.TrimSuffix(path.Base(file), ".json")
 		d.root[o.getAGoodFileName()] = &o
 	}
 
@@ -476,9 +515,7 @@ func (p *Printer) PrintObjectStates(root string, objs []map[string]interface{}) 
 	}
 	// Root objects all share the top-level objects directory, so their
 	// filenames must be unique or one would silently overwrite another.
-	if err := checkFilenameCollisions(ocs); err != nil {
-		return nil, fmt.Errorf("root objects: %v", err)
-	}
+	resolveFilenameCollisions(ocs)
 
 	for _, oc := range ocs {
 		order = append(order, oc.getAGoodFileName())
